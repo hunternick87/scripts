@@ -28,4 +28,5 @@ then you can run the script
 ```
 ./launch_vnc_latest.sh username@domain
 ```
-When it asks for your sudo password its the password for your wsl, the login when it was for a username then password is your UMBC login that you use for the VPN.
+When it asks for your sudo password its the password for your wsl. 
+The login when its a username then password is your UMBC login that you use for the VPN.

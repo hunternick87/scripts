@@ -30,3 +30,21 @@ then you can run the script
 ```
 When it asks for your sudo password its the password for your wsl. 
 The login when its a username then password is your UMBC login that you use for the VPN.
+
+
+Fresh desktop (ends all of your existing VNC sessions on the selected host):
+```bash
+bash launch_vnc_latest.sh --fresh username@domain
+bash launch_vnc_latest.sh --fresh --openbox username@domain
+```
+IceWM remains the default. Without `--fresh`, an existing session is reused.
+`--fresh` stops each session listed for your SSH account with TurboVNC's
+`-kill :DISPLAY`, then starts the selected desktop. Programs in those sessions
+are closed. Other users' sessions are not targeted. A listing or stop failure
+aborts the launch instead of silently reusing a session.
+
+If you saved the bootstrap as `latest.sh`, use the same flags with that name.
+Existing bootstrap copies already forward all arguments, so no new download is
+needed: they fetch the updated VPN wrapper and VNC client on their next run.
+Both downloaded scripts also accept `--fresh` directly. Put options before the
+`username@domain` argument; `--fresh` and `--openbox` work in either order.

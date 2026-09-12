@@ -11,13 +11,26 @@ set -Eeuo pipefail
 
 script_path="/umbc/software/scripts/vnc/server-user/scripts"
 desktop=icewm
-if [[ "${1:-}" == --openbox ]]; then
-  desktop=openbox
+fresh=false
+usage() {
+  echo "Usage: $0 [--openbox] [--fresh] [user@]server"
+  echo "  --openbox  Request Openbox instead of IceWM."
+  echo "  --fresh    Stop your VNC sessions on this host before starting a new desktop."
+  echo "Without --fresh, existing sessions are reused."
+}
+while (($#)); do
+  case "$1" in
+    --openbox) desktop=openbox ;;
+    --fresh) fresh=true ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+    *) break ;;
+  esac
   shift
-fi
-
+done
 if (($# != 1)) || [[ ! "$1" =~ ^([[:alnum:]_.-]+@)?[[:alnum:]][[:alnum:]_.-]*$ ]]; then
-  echo "Usage: $0 [--openbox] [user@]server" >&2
+  usage >&2
   exit 2
 fi
 ssh_target=$1
@@ -93,7 +106,61 @@ if ! ssh -S "$control_file" -M -o ControlPersist=no -o ServerAliveInterval=30 -o
   echo "ERROR: SSH authentication or connection failed." >&2
   exit 1
 fi
-echo "Requesting UMBC $desktop TurboVNC session (existing sessions are reused)..."
+if "$fresh"; then
+  # Run as the SSH user. TurboVNC -list consults that user's session records;
+  # never use sudo, global process matching, or another user's display list.
+  if ! ssh -S "$control_file" -o BatchMode=yes "$ssh_target" 'bash -s' <<'REMOTE_FRESH'
+set -Eeuo pipefail
+vncserver=/umbc/software/TurboVNC/bin/vncserver
+list_displays() {
+  local listing line number
+  listing=$("$vncserver" -list) || {
+    echo "ERROR: Could not list your TurboVNC sessions." >&2
+    return 1
+  }
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[[:space:]]*: ]]; then
+      if [[ ! "$line" =~ ^[[:space:]]*:([0-9]{1,5})[[:space:]] ]]; then
+        echo "ERROR: Invalid display in TurboVNC session list; restart cancelled." >&2
+        return 1
+      fi
+      number=$((10#${BASH_REMATCH[1]}))
+      if ((number > 59635)); then
+        echo "ERROR: TurboVNC display is outside the valid port range." >&2
+        return 1
+      fi
+      printf ':%d\n' "$number"
+    fi
+  done <<< "$listing"
+}
+# Validate the entire list before stopping anything.
+displays=$(list_displays)
+if [[ -n "$displays" ]]; then
+  while IFS= read -r display; do
+    echo "Existing VNC session found on $display."
+    echo "--fresh requested; stopping VNC session $display..."
+    "$vncserver" -kill "$display" || {
+      echo "ERROR: Could not stop $display; restart cancelled." >&2
+      exit 1
+    }
+  done <<< "$displays"
+  remaining=$(list_displays)
+  if [[ -n "$remaining" ]]; then
+    echo "ERROR: VNC sessions remain; refusing to reuse an old session in fresh mode." >&2
+    exit 1
+  fi
+else
+  echo "--fresh requested; no existing VNC sessions found."
+fi
+REMOTE_FRESH
+  then
+    echo "ERROR: Fresh session cleanup failed; no new desktop was requested." >&2
+    exit 1
+  fi
+  echo "Starting new UMBC $desktop VNC session..."
+else
+  echo "Requesting UMBC $desktop TurboVNC session (existing sessions are reused)..."
+fi
 if ! ssh -S "$control_file" -o BatchMode=yes "$ssh_target" "$script_path/launch_vncserver_${desktop}.sh"; then
   echo "ERROR: The remote $desktop session launcher failed." >&2
   exit 1

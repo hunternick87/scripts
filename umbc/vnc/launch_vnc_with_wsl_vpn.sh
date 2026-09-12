@@ -20,6 +20,7 @@ Usage: launch_vnc_with_wsl_vpn.sh [options] [user@]server
 
 Options:
   --openbox            Request Openbox instead of IceWM (existing sessions are reused).
+  --fresh              Stop your VNC sessions on this host and start a new desktop.
   --no-vpn             Do not start the WSL VPN.
   --keep-vpn           Leave a VPN started by this script connected on exit.
   --vpn-host HOST      Override gpvpn.umbc.edu.
@@ -36,7 +37,8 @@ EOF
 
 while (($#)); do
   case "$1" in
-    --openbox) CLIENT_OPTIONS=(--openbox) ;;
+    --openbox) CLIENT_OPTIONS+=(--openbox) ;;
+    --fresh) CLIENT_OPTIONS+=(--fresh) ;;
     --no-vpn) USE_VPN=false ;;
     --keep-vpn) KEEP_VPN=true ;;
     --vpn-as-gateway) VPN_AS_GATEWAY=true ;;

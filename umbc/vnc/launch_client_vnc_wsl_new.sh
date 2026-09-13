@@ -12,16 +12,19 @@ set -Eeuo pipefail
 script_path="/umbc/software/scripts/vnc/server-user/scripts"
 desktop=icewm
 fresh=false
+kill_vnc=false
 usage() {
-  echo "Usage: $0 [--openbox] [--fresh] [user@]server"
+  echo "Usage: $0 [--openbox] [--fresh | --kill-vnc] [user@]server"
   echo "  --openbox  Request Openbox instead of IceWM."
   echo "  --fresh    Stop your VNC sessions on this host before starting a new desktop."
-  echo "Without --fresh, existing sessions are reused."
+  echo "  --kill-vnc Stop your VNC sessions and exit without opening a viewer."
+  echo "Without --fresh or --kill-vnc, existing sessions are reused."
 }
 while (($#)); do
   case "$1" in
     --openbox) desktop=openbox ;;
     --fresh) fresh=true ;;
+    --kill-vnc) kill_vnc=true ;;
     -h|--help) usage; exit 0 ;;
     --) shift; break ;;
     -*) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -34,7 +37,13 @@ if (($# != 1)) || [[ ! "$1" =~ ^([[:alnum:]_.-]+@)?[[:alnum:]][[:alnum:]_.-]*$ ]
   exit 2
 fi
 ssh_target=$1
+if "$fresh" && "$kill_vnc"; then
+  echo "ERROR: Choose either --fresh or --kill-vnc, not both." >&2
+  exit 2
+fi
 
+# Stop-only mode does not require a viewer installation.
+if ! "$kill_vnc"; then
 # --- Locate vncviewer ---
 vncpath=""
 vncviewer_cmd="${VNCVIEWER:-}"
@@ -87,6 +96,8 @@ else
   echo "Using vncviewer: $vncviewer_cmd"
 fi
 
+fi
+
 # Reuse one authenticated SSH connection for setup and forwarding.
 temp_dir=$(mktemp -d)
 control_file="$temp_dir/ssh"
@@ -106,7 +117,7 @@ if ! ssh -S "$control_file" -M -o ControlPersist=no -o ServerAliveInterval=30 -o
   echo "ERROR: SSH authentication or connection failed." >&2
   exit 1
 fi
-if "$fresh"; then
+if "$fresh" || "$kill_vnc"; then
   # Run as the SSH user. TurboVNC -list consults that user's session records;
   # never use sudo, global process matching, or another user's display list.
   if ! ssh -S "$control_file" -o BatchMode=yes "$ssh_target" 'bash -s' <<'REMOTE_FRESH'
@@ -136,26 +147,84 @@ list_displays() {
 # Validate the entire list before stopping anything.
 displays=$(list_displays)
 if [[ -n "$displays" ]]; then
+  stop_failed=false
   while IFS= read -r display; do
     echo "Existing VNC session found on $display."
-    echo "--fresh requested; stopping VNC session $display..."
+    echo "Stopping VNC session $display..."
     "$vncserver" -kill "$display" || {
-      echo "ERROR: Could not stop $display; restart cancelled." >&2
-      exit 1
+      echo "ERROR: Could not stop $display; continuing with other listed sessions." >&2
+      stop_failed=true
     }
   done <<< "$displays"
   remaining=$(list_displays)
   if [[ -n "$remaining" ]]; then
-    echo "ERROR: VNC sessions remain; refusing to reuse an old session in fresh mode." >&2
+    # TurboVNC may report success even when Xvnc ignored its TERM signal.
+    # Re-read the session PID, then independently verify ownership, executable
+    # name and display before escalating. Never trust a stale PID by itself.
+    while IFS= read -r display; do
+      listing=$("$vncserver" -list)
+      pid=$(awk -v display="$display" '$1 == display {print $2}' <<< "$listing")
+      if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]]; then
+        echo "ERROR: No unambiguous PID for $display; refusing a forced stop." >&2
+        exit 1
+      fi
+      identity=$(ps -p "$pid" -o uid= -o comm= -o args=) || {
+        echo "ERROR: Could not verify PID $pid; retry cleanup if it has exited." >&2
+        exit 1
+      }
+      read -r process_uid process_name process_args <<< "$identity"
+      if [[ "$process_uid" != "$(id -u)" || "$process_name" != Xvnc ]] ||
+         [[ ! " $process_args " =~ [[:space:]]${display}[[:space:]] ]]; then
+        echo "ERROR: PID $pid does not match your Xvnc session $display; refusing a forced stop." >&2
+        exit 1
+      fi
+      echo "Session $display did not stop normally; force-stopping your Xvnc PID $pid..."
+      kill -KILL -- "$pid" || {
+        echo "ERROR: Could not force-stop PID $pid." >&2
+        exit 1
+      }
+      # Allow process exit before asking TurboVNC to remove its PID/socket files.
+      stopped=false
+      for ((attempt = 0; attempt < 20; attempt++)); do
+        state=$(ps -p "$pid" -o stat=) || state=""
+        if [[ -z "$state" || "$state" == *Z* ]]; then
+          stopped=true
+          break
+        fi
+        sleep 0.1
+      done
+      if ! "$stopped"; then
+        echo "ERROR: PID $pid is still present after SIGKILL; cleanup aborted." >&2
+        exit 1
+      fi
+      "$vncserver" -kill "$display" || {
+        echo "ERROR: Process stopped, but TurboVNC could not clean up $display." >&2
+        exit 1
+      }
+    done <<< "$remaining"
+    remaining=$(list_displays)
+    if [[ -n "$remaining" ]]; then
+      echo "ERROR: VNC sessions still remain:" >&2
+      printf '%s\n' "$remaining" >&2
+      exit 1
+    fi
+    stop_failed=false
+  fi
+  if "$stop_failed"; then
     exit 1
   fi
+
 else
-  echo "--fresh requested; no existing VNC sessions found."
+  echo "No existing sessions were found in your TurboVNC session list."
 fi
 REMOTE_FRESH
   then
-    echo "ERROR: Fresh session cleanup failed; no new desktop was requested." >&2
+    echo "ERROR: VNC cleanup failed; no new desktop was requested." >&2
     exit 1
+  fi
+  if "$kill_vnc"; then
+    echo "VNC cleanup complete. No desktop or viewer will be started."
+    exit 0
   fi
   echo "Starting new UMBC $desktop VNC session..."
 else

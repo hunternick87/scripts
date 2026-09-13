@@ -31,6 +31,7 @@ if sys.argv[1:] == ["-list"]:
     for display in state.read_text().splitlines(): print(display + "    12345")
 elif len(sys.argv) == 3 and sys.argv[1] == "-kill":
     if os.environ.get("KILL_FAIL"): sys.exit(1)
+    if os.environ.get("DEADLOCK") and not Path(os.environ["FORCED"]).exists(): sys.exit(0)
     if not os.environ.get("REMAIN"):
         rows = [s for s in state.read_text().splitlines() if s != sys.argv[2]]
         state.write_text("".join(s + "\n" for s in rows))
@@ -45,6 +46,9 @@ command = args[-1]
 state = Path(os.environ["STATE"])
 if command == "bash -s":
     source = sys.stdin.read().replace("/umbc/software/TurboVNC/bin/vncserver", os.environ["MOCK_VNCSERVER"])
+    # Override Bash's signal builtin in the isolated remote fixture so tests
+    # can never signal real processes, even if identity validation regresses.
+    source = 'kill() { printf "FORCE: %s\\n" "$*" >> "$CALLS"; touch "$FORCED"; }\n' + source
     sys.exit(subprocess.run(["bash"], input=source, text=True).returncode)
 elif "launch_vncserver_" in command:
     if not state.read_text(): state.write_text(":20\n")
@@ -55,13 +59,24 @@ else: sys.exit(99)
 ''')
         self.stub("viewer", 'import sys\nsys.stdin.read()\n')
         self.stub("ss", 'pass\n')
+        self.stub("ps", r'''import os, sys
+from pathlib import Path
+if not os.environ.get("DEADLOCK"): sys.exit(1)
+if "stat=" in sys.argv:
+    if not Path(os.environ["FORCED"]).exists(): print("S")
+else:
+    uid = os.getuid() + int(bool(os.environ.get("WRONG_OWNER")))
+    name = "bash" if os.environ.get("WRONG_NAME") else "Xvnc"
+    display = ":99" if os.environ.get("WRONG_DISPLAY") else ":12"
+    print(f"{uid} {name} /umbc/software/TurboVNC/bin/Xvnc {display}")
+''')
         self.stub("curl", r'''import os, shutil, sys
 from pathlib import Path
 args = sys.argv[1:]
 shutil.copyfile(Path(os.environ["SOURCE_ROOT"]) / args[-1].rsplit("/", 1)[-1], args[args.index("--output") + 1])
 ''')
         self.env = dict(os.environ, PATH=str(self.path) + ":" + os.environ["PATH"],
-                        STATE=str(self.state), CALLS=str(self.calls),
+                        STATE=str(self.state), CALLS=str(self.calls), FORCED=str(self.path / "forced"),
                         MOCK_VNCSERVER=str(self.path / "vncserver"),
                         VNCVIEWER=str(self.path / "viewer"), SOURCE_ROOT=str(ROOT))
 
@@ -148,6 +163,50 @@ shutil.copyfile(Path(os.environ["SOURCE_ROOT"]) / args[-1].rsplit("/", 1)[-1], a
     def test_unknown_option_rejected_without_ssh(self):
         self.run_launcher("--unknown", expected=2)
         self.assertEqual(self.log(), "")
+
+    def test_kill_mode_skips_viewer_and_session_start(self):
+        self.env["VNCVIEWER"] = "/does/not/exist"
+        self.run_launcher("--kill-vnc")
+        self.assertEqual(self.state.read_text(), "")
+        self.assertNotIn("launch_vncserver_", self.log())
+        self.assertNotIn("get_vncpasswd.sh", self.log())
+        self.assertNotIn("-O forward", self.log())
+
+    def test_kill_mode_empty_list(self):
+        self.state.write_text("")
+        self.run_launcher("--kill-vnc")
+        self.assertNotIn("vncserver -kill", self.log())
+        self.assertNotIn("launch_vncserver_", self.log())
+
+    def test_conflicting_modes_rejected(self):
+        self.run_launcher("--fresh", "--kill-vnc", expected=2)
+        self.assertEqual(self.log(), "")
+
+    def test_deadlock_force_stop_and_cleanup(self):
+        self.env["DEADLOCK"] = "1"
+        self.run_launcher("--kill-vnc")
+        self.assertIn("FORCE: -KILL -- 12345", self.log())
+        self.assertEqual(self.log().count("vncserver -kill :12"), 2)
+        self.assertEqual(self.state.read_text(), "")
+        self.assertNotIn("launch_vncserver_", self.log())
+
+    def test_deadlock_fresh_restarts_after_cleanup(self):
+        self.env["DEADLOCK"] = "1"
+        self.run_launcher("--fresh", "--openbox")
+        self.assertIn("FORCE: -KILL -- 12345", self.log())
+        self.assertEqual(self.state.read_text(), ":20\n")
+        self.assertIn("launch_vncserver_openbox.sh", self.log())
+
+    def test_force_refused_for_mismatched_process(self):
+        self.env["DEADLOCK"] = "1"
+        for key in ("WRONG_OWNER", "WRONG_NAME", "WRONG_DISPLAY"):
+            with self.subTest(key=key):
+                self.calls.unlink(missing_ok=True)
+                self.env[key] = "1"
+                self.run_launcher("--kill-vnc", expected=1)
+                del self.env[key]
+                self.assertNotIn("FORCE:", self.log())
+                self.assertEqual(self.state.read_text(), ":12\n")
 
     def test_help_through_old_bootstrap(self):
         result = subprocess.run(["bash", str(ROOT / "launch_vnc_latest.sh"), "--help"],
